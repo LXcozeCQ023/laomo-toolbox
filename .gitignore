@@ -1,0 +1,39 @@
+# 运行组件由安装脚本下载，不入库（node 单文件 100MB+，超过 GitHub 单文件上限）
+bin/
+**/bin/
+
+# 本机偏好与生成物
+config.json
+**/config.json
+.DS_Store
+*.log
+*.part
+.视频下载器临时/
+.cleanroom/
+dist/
+**/dist/
+
+# 编辑器与包管理噪声
+.vscode/
+.idea/
+node_modules/
+**/node_modules/
+
+# 下载产物与本地状态
+*.mp4
+*.mkv
+*.mov
+*.mp3
+*.m4a
+*.webm
+*.db
+*.sqlite
+*.exe
+*.dll
+*.zip
+*.tar.gz
+cookies.txt
+cookies.json
+**/Cookies
+**/User Data/
+**/browser-profile*/
