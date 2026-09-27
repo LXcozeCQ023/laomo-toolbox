@@ -90,6 +90,7 @@ let PROXY_ON = !!ACTIVE_PROXY;
 const PROXY_CANDIDATES = [
   { port: 7897, scheme: 'http' }, // Clash Verge 常用 mixed-port
   { port: 7890, scheme: 'http' },
+  { port: 7892, scheme: 'http' }, // 本机实测：Clash 有时候只开这个
   { port: 10809, scheme: 'http' },
   { port: 7891, scheme: 'socks5' },
   { port: 10808, scheme: 'socks5' },
