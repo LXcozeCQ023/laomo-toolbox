@@ -86,6 +86,7 @@ const ytdlp = runtimeFor(__dirname, 'yt-dlp');
 const YTDLP_CMD = ytdlp ? [ytdlp] : null;
 
 let ACTIVE_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
+let PROXY_ON = !!ACTIVE_PROXY;
 const PROXY_CANDIDATES = [
   { port: 7897, scheme: 'http' }, // Clash Verge 常用 mixed-port
   { port: 7890, scheme: 'http' },
@@ -94,8 +95,20 @@ const PROXY_CANDIDATES = [
   { port: 10808, scheme: 'socks5' },
   { port: 1080, scheme: 'socks5' },
 ];
-function detectProxy(cb) {
-  if (ACTIVE_PROXY) return cb(ACTIVE_PROXY);
+
+// 只探端口后面有没有人在监听，不发真实请求。
+function proxyAlive(proxyUrl, cb) {
+  const match = String(proxyUrl || '').match(/^(https?|socks5):\/\/([^:/]+):(\d+)\/?$/i);
+  if (!match) return cb(false);
+  const socket = require('net').connect({ host: match[2], port: Number(match[3]), timeout: 500 });
+  let settled = false;
+  const finish = (ok) => { if (settled) return; settled = true; socket.destroy(); cb(ok); };
+  socket.on('connect', () => finish(true));
+  socket.on('error', () => finish(false));
+  socket.on('timeout', () => finish(false));
+}
+
+function scanProxy(cb) {
   const net = require('net');
   let index = 0;
   const tryNext = () => {
@@ -114,6 +127,32 @@ function detectProxy(cb) {
     s.on('timeout', () => { s.destroy(); finish(false); });
   };
   tryNext();
+}
+
+function applyProxy(found) {
+  const changed = found !== ACTIVE_PROXY;
+  ACTIVE_PROXY = found;
+  PROXY_ON = !!found;
+  // 内置 fetch 和 yt-dlp 子进程都从环境变量取代理，换地址时要同步过去；
+  // 旧地址已经死了更要清掉，否则所有请求都会被带进黑洞，一路卡到超时。
+  if (changed) {
+    if (found) { process.env.HTTPS_PROXY = found; process.env.HTTP_PROXY = found; }
+    else { delete process.env.HTTPS_PROXY; delete process.env.HTTP_PROXY; }
+  }
+  return found;
+}
+
+// 环境变量里的代理可能来自宿主会话，宿主一退出端口就没了；上次扫描锁定的端口
+// 也可能因为换节点、改端口而关闭。死代理一旦锁死，之后每个任务都会超时，
+// 所以复用之前先确认它还活着，不通就重新扫描。
+function detectProxy(cb) {
+  if (!ACTIVE_PROXY) return scanProxy(cb);
+  proxyAlive(ACTIVE_PROXY, (ok) => (ok ? cb(ACTIVE_PROXY) : scanProxy(cb)));
+}
+
+// 每个任务开始前再确认一次代理，让服务长时间运行时也能跟上代理的变化。
+function ensureProxy() {
+  return new Promise((resolve) => detectProxy((found) => resolve(applyProxy(found))));
 }
 
 // ── 配置 ──
@@ -564,6 +603,7 @@ async function runDouyinJob(job) {
   const tempDir = path.join(job.dir, '.视频下载器临时');
   let partFile = '';
   try {
+    await ensureProxy();
     job.phase = '获取抖音游客视频信息';
     let info;
     try {
@@ -627,6 +667,7 @@ async function runYangshipinJob(job) {
   const tempDir = path.join(job.dir, '.视频下载器临时');
   let partFile = '';
   try {
+    await ensureProxy();
     for (let attempt = 1; attempt <= 2; attempt++) {
       job.attempt = attempt;
       job.phase = attempt === 1 ? '获取央视频公开播放信息' : '重新获取央视频播放地址';
@@ -755,7 +796,8 @@ function newJob(url, dir) {
   return job;
 }
 
-function runYtdlpJob(job, options = {}) {
+async function runYtdlpJob(job, options = {}) {
+  await ensureProxy();
   const { url, dir } = job;
   const downloadUrl = options.mediaUrl || url;
   const isXhs = isXiaohongshuUrl(url);
@@ -982,7 +1024,6 @@ refreshConf();tick();
 </script></div></body></html>`;
 
 // ── HTTP 服务 ──
-let PROXY_ON = !!ACTIVE_PROXY;
 const SECURITY_HEADERS = {
   'Cache-Control': 'no-store',
   'Cross-Origin-Resource-Policy': 'same-origin',
@@ -1246,12 +1287,7 @@ function listen(port, tries) {
   function onListening() {
     const url = `http://localhost:${port}`;
     detectProxy((proxyUrl) => {
-      ACTIVE_PROXY = proxyUrl;
-      PROXY_ON = !!proxyUrl;
-      if (proxyUrl) {
-        process.env.HTTPS_PROXY = proxyUrl;
-        process.env.HTTP_PROXY = proxyUrl;
-      }
+      applyProxy(proxyUrl);
       console.log(`\n  🎬 视频下载器 → ${url}`);
       console.log(`  引擎: ${YTDLP_CMD ? 'macOS 独立版' : '❌ 无'}  ffmpeg: ${FFMPEG ? '✓' : '无'}  Node: ${JS_NODE ? '✓' : '无'}  代理: ${ACTIVE_PROXY || '未开(YouTube不可用)'}\n`);
       openBrowser(url);
@@ -1269,4 +1305,5 @@ module.exports = {
   inspectMedia, isXiaohongshuUrl, resolveXiaohongshuUrl,
   extractDouyinVideoId, getDouyinVideoInfo, isDouyinMediaUrl, newJob, isAllowedHost, isAllowedOrigin,
   publicJob, MAX_JSON_BODY, BUILD_ID, INSTANCE_ID, finishVideoJob, canShutdown,
+  proxyAlive, detectProxy, ensureProxy, getActiveProxy: () => ACTIVE_PROXY,
 };
