@@ -1128,7 +1128,25 @@ function body(req) {
 let shuttingDown = false;
 function canShutdown(entries) { return ![...entries].some(job => job.status === 'running'); }
 
+// 不用的时候不占着机器：超过设定分钟没有任何请求、也没有正在跑的任务，就自己退出。
+// 退出码 0，守护进程不会把它拉回来；下次双击「老默工具箱」重新打开即可。
+// 想关掉这个行为就在启动时设 IDLE_EXIT_MINUTES=0。
+const IDLE_EXIT_MS = (Number(process.env.IDLE_EXIT_MINUTES) || 20) * 60 * 1000;
+let lastActivity = Date.now();
+function idleWatch() {
+  if (IDLE_EXIT_MS <= 0) return;
+  const timer = setInterval(() => {
+    if (shuttingDown) return;
+    if (!canShutdown(jobs.values())) return;   // 有任务在跑就不退出
+    if (Date.now() - lastActivity < IDLE_EXIT_MS) return;
+    console.log(`${process.env.IDLE_EXIT_MINUTES || 20} 分钟无人使用，已自动退出。`);
+    process.exit(0);
+  }, 60000);
+  timer.unref();
+}
+
 const server = http.createServer(async (req, res) => {
+  lastActivity = Date.now();
   try {
   if (!isAllowedHost(req.headers.host)) return json(res, { err: 'forbidden host' }, 403);
   if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'))) {
@@ -1289,6 +1307,7 @@ function listen(port, tries) {
     const url = `http://localhost:${port}`;
     detectProxy((proxyUrl) => {
       applyProxy(proxyUrl);
+      idleWatch();
       console.log(`\n  🎬 视频下载器 → ${url}`);
       console.log(`  引擎: ${YTDLP_CMD ? 'macOS 独立版' : '❌ 无'}  ffmpeg: ${FFMPEG ? '✓' : '无'}  Node: ${JS_NODE ? '✓' : '无'}  代理: ${ACTIVE_PROXY || '未开(YouTube不可用)'}\n`);
       openBrowser(url);
