@@ -92,7 +92,11 @@ function chooseImages(item) {
       ...(Array.isArray(image.url_list) ? image.url_list : []),
       ...(Array.isArray(image.urlList) ? image.urlList : []),
     ];
-    const picked = candidates.find((url) => typeof url === 'string' && isAllowedMediaUrl(url));
+    // 抖音同时给了带水印（tplv-dy-water）和不带水印（tplv-dy-aweme-images）两种模板
+    // 的地址，签名各自独立、都是同尺寸原图。download_url_list 在前但往往是带水印的，
+    // 所以别按列表顺序迷信「下载专用」，优先挑不带水印的，实在没有才退而求其次。
+    const usable = candidates.filter((url) => typeof url === 'string' && isAllowedMediaUrl(url));
+    const picked = usable.find((url) => !/dy-water/i.test(url)) || usable[0];
     if (picked && !seen.has(picked)) {
       seen.add(picked);
       urls.push(picked);
@@ -390,6 +394,10 @@ async function resolveOnce(videoId, proxy, noSandbox) {
         if (text.length > 8 * 1024 * 1024 || !text.includes(String(videoId))) return;
         const item = findItem(JSON.parse(text), videoId);
         if (!item) return;
+        // 调试钩子：把命中的原始作品数据整个落盘，排查"拿到的地址是不是最好的"这类问题。
+        if (process.env.SHINEWOOD_DUMP_ITEM) {
+          try { fs.writeFileSync(process.env.SHINEWOOD_DUMP_ITEM, JSON.stringify(item, null, 2)); } catch {}
+        }
         const base = {
           id: String(videoId),
           title: String(item.desc || '抖音作品').slice(0, 200),

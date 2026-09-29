@@ -26,6 +26,17 @@ assert.strictEqual(douyinAnonymous.chooseVideo({ video: { bit_rate: [
 ] } }), 'https://v26-web.douyinvod.com/h264-high');
 assert.strictEqual(douyinAnonymous.isAllowedMediaUrl('https://evil.example/video'), false);
 
+// 图文选地址：download_url_list 在前但往往是带水印的（tplv-dy-water），
+// 同一张图的 url_list 里有不带水印的原图（tplv-dy-aweme-images），应优先挑后者。
+{
+  const watermarked = 'https://p3-sign.douyinpic.com/tos-cn-i-0813/abc~tplv-dy-water-v2:2160:2832:q75.webp';
+  const clean = 'https://p3-sign.douyinpic.com/tos-cn-i-0813/abc~tplv-dy-aweme-images:q75.webp';
+  const item = { images: [{ download_url_list: [watermarked], url_list: [clean] }] };
+  assert.deepStrictEqual(douyinAnonymous.chooseImages(item), [clean], '应优先挑不带水印的地址');
+  const onlyWater = { images: [{ download_url_list: [watermarked], url_list: [] }] };
+  assert.deepStrictEqual(douyinAnonymous.chooseImages(onlyWater), [watermarked], '没有无水印地址时应退回带水印的');
+}
+
 // 匿名临时会话的启动参数：沙箱被宿主限制时要有 --no-sandbox 这条退路，
 // 否则 Chrome 的网络进程会反复崩溃，表现为"匿名浏览器启动超时"。
 const plainArgs = douyinAnonymous.chromeArgs('/tmp/douyin-profile', '', false);
