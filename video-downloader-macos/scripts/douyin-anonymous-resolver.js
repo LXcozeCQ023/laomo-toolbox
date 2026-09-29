@@ -241,6 +241,16 @@ function stopBrowser(child) {
   try { child.kill(); } catch {}
 }
 
+function waitForExit(child, timeoutMs) {
+  if (!child || child.exitCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = (value) => { clearTimeout(timer); child.removeListener('exit', onExit); resolve(value); };
+    const onExit = () => done(true);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
 function watchBrowserOwner(child, timeoutMs) {
   const stop = () => stopBrowser(child);
   const cancel = message => { if (message === 'cancel') stop(); };
@@ -385,9 +395,15 @@ async function resolveOnce(videoId, proxy, noSandbox) {
     releaseOwnerWatch();
     cdp?.close();
     stopBrowser(child);
-    await sleep(300);
+    // 等 Chrome 真的退出再删配置目录：只 sleep 一小会儿就删，它会边写边被杀，
+    // 每个任务都会在临时目录留一份上百 KB 的残留。
+    await waitForExit(child, 3000);
     if (!path.resolve(profileDir).startsWith(path.resolve(os.tmpdir()) + path.sep) || !path.basename(profileDir).startsWith('shinewood-douyin-')) throw new Error('临时目录检查失败');
-    try { fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 200 }); } catch {}
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try { fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 2, retryDelay: 200 }); } catch {}
+      if (!fs.existsSync(profileDir)) break;
+      await sleep(400);
+    }
   }
 }
 
