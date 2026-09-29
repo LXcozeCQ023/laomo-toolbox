@@ -160,7 +160,15 @@ async function settled(job) {
   assert.strictEqual(wrong.status, 'error', '非图片内容必须判失败');
   assert.match(wrong.err, /不是图片/);
 
-  console.log('抖音图文测试通过：标题第一句作子目录名、图集解析、逐张下载、序号命名、webp 转 jpg、偶发失败自动重试、文件头与结尾校验、重复识别、同名目录续传补缺、非图集同名目录不覆盖、失败保留已下载图片、损坏与非图片内容拒绝。');
+  // 失效的分享短链：抖音会把它 302 回首页。这时要给出能照着做的提示，
+  // 而不是一句「没识别出编号」让人以为是工具坏了。
+  assert.strictEqual(app.isExpiredShareLink('https://v.douyin.com/abcDEF/', 'https://www.douyin.com/'), true, '短链跳回首页应判为失效');
+  assert.strictEqual(app.isExpiredShareLink('https://v.douyin.com/abcDEF/', 'https://www.douyin.com/?a=1'), true, '首页带查询参数也应判为失效');
+  assert.strictEqual(app.isExpiredShareLink('https://v.douyin.com/abcDEF/', 'https://www.iesdouyin.com/share/video/7519000000000000000/'), false, '正常跳转到作品页不算失效');
+  assert.strictEqual(app.isExpiredShareLink('https://www.douyin.com/video/7519000000000000000', 'https://www.douyin.com/'), false, '长链不该被判成失效短链');
+  assert.strictEqual(app.isExpiredShareLink('https://v.douyin.com/abcDEF/', '这不是一个地址'), false, '解析不了就按普通失败处理');
+
+  console.log('抖音图文测试通过：标题第一句作子目录名、图集解析、逐张下载、序号命名、webp 转 jpg、偶发失败自动重试、文件头与结尾校验、重复识别、同名目录续传补缺、非图集同名目录不覆盖、失败保留已下载图片、损坏与非图片内容拒绝、失效分享短链识别。');
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; }).finally(() => {
   globalThis.fetch = realFetch;
   server.closeAllConnections();

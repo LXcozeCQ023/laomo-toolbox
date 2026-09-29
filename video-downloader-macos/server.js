@@ -283,6 +283,19 @@ function extractDouyinVideoId(value) {
   return '';
 }
 
+// 抖音把失效或过期的分享短链直接 302 回首页，页面里自然找不到作品编号。
+// 之前这种情况只报一句「没有识别出视频编号」，看着像工具坏了，其实是链接的事。
+function isExpiredShareLink(originalUrl, resolvedUrl) {
+  if (!/^https?:\/\/v\.douyin\.com\//i.test(String(originalUrl || ''))) return false;
+  try {
+    const parsed = new URL(resolvedUrl);
+    const host = parsed.hostname.toLowerCase();
+    return (host === 'douyin.com' || host === 'www.douyin.com') && (parsed.pathname === '/' || parsed.pathname === '');
+  } catch {
+    return false;
+  }
+}
+
 async function getDouyinVideoInfo(originalUrl) {
   let id = extractDouyinVideoId(originalUrl);
   if (!id) {
@@ -290,6 +303,9 @@ async function getDouyinVideoInfo(originalUrl) {
     id = extractDouyinVideoId(resolved.url)
       || resolved.text.match(/"(?:aweme_id|itemId)"\s*:\s*"(\d{15,25})"/i)?.[1]
       || '';
+    if (!id && isExpiredShareLink(originalUrl, resolved.url)) {
+      throw new Error('这条分享链接已经失效（抖音把它跳回了首页）。请在抖音里重新点「分享 → 复制链接」再试');
+    }
   }
   if (!id) throw new Error('没有从抖音链接中识别出视频编号');
   try {
@@ -1385,7 +1401,7 @@ if (require.main === module) {
 
 module.exports = {
   inspectMedia, isXiaohongshuUrl, resolveXiaohongshuUrl,
-  extractDouyinVideoId, getDouyinVideoInfo, isDouyinMediaUrl, newJob, isAllowedHost, isAllowedOrigin,
+  extractDouyinVideoId, getDouyinVideoInfo, isDouyinMediaUrl, isExpiredShareLink, newJob, isAllowedHost, isAllowedOrigin,
   publicJob, MAX_JSON_BODY, BUILD_ID, INSTANCE_ID, finishVideoJob, canShutdown,
   proxyAlive, detectProxy, ensureProxy, getActiveProxy: () => ACTIVE_PROXY,
 };
