@@ -26,6 +26,25 @@ assert.strictEqual(douyinAnonymous.chooseVideo({ video: { bit_rate: [
 ] } }), 'https://v26-web.douyinvod.com/h264-high');
 assert.strictEqual(douyinAnonymous.isAllowedMediaUrl('https://evil.example/video'), false);
 
+// 匿名临时会话的启动参数：沙箱被宿主限制时要有 --no-sandbox 这条退路，
+// 否则 Chrome 的网络进程会反复崩溃，表现为"匿名浏览器启动超时"。
+const plainArgs = douyinAnonymous.chromeArgs('/tmp/douyin-profile', '', false);
+assert.strictEqual(plainArgs.includes('--no-sandbox'), false);
+assert.strictEqual(plainArgs.includes('--user-data-dir=/tmp/douyin-profile'), true);
+assert.strictEqual(plainArgs.includes('--remote-debugging-port=0'), true);
+const fallbackArgs = douyinAnonymous.chromeArgs('/tmp/douyin-profile', 'http://127.0.0.1:7890', true);
+assert.strictEqual(fallbackArgs.includes('--no-sandbox'), true);
+assert.strictEqual(fallbackArgs.includes('--proxy-server=http://127.0.0.1:7890'), true);
+assert.strictEqual(fallbackArgs[fallbackArgs.length - 1], 'about:blank');
+assert.strictEqual(douyinAnonymous.SANDBOX_BLOCKED_RE.test('Failed to initialize sandbox.'), true);
+assert.strictEqual(douyinAnonymous.SANDBOX_BLOCKED_RE.test('GPU process exited unexpectedly'), false);
+assert.match(douyinAnonymous.browserDiagnosis('Failed to initialize sandbox.'), /--no-sandbox/);
+// Chrome 正常启动时 stderr 里也有 sandbox / GPU 噪声，所以诊断要以最后一条致命日志为准。
+assert.strictEqual(
+  douyinAnonymous.chromeFatalLine('Failed to initialize sandbox.\n[1:FATAL:gpu.cc:417] GPU process isn\'t usable. Goodbye.'),
+  '[1:FATAL:gpu.cc:417] GPU process isn\'t usable. Goodbye.',
+);
+
 assert.strictEqual(app.isAllowedHost('localhost:3210'), true);
 assert.strictEqual(app.isAllowedHost('127.0.0.1:3210'), true);
 assert.strictEqual(app.isAllowedHost('attacker.example'), false);

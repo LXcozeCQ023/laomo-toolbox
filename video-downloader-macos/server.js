@@ -309,8 +309,14 @@ async function getDouyinVideoInfo(originalUrl) {
   }
   if (!id) throw new Error('没有从抖音链接中识别出视频编号');
   try {
-    const share = await fetchText(`https://www.iesdouyin.com/share/video/${id}/`);
-    const routerJson = share.text.match(/window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/)?.[1];
+    // 抖音的分享页分成 /share/video/ 和 /share/note/ 两条路由，各自吐一份结构不同的
+    // _ROUTER_DATA；图文作品走 video 这条常常连数据脚本都拿不到，所以两条都试。
+    let routerJson = '';
+    for (const route of ['video', 'note']) {
+      const share = await fetchText(`https://www.iesdouyin.com/share/${route}/${id}/`);
+      routerJson = share.text.match(/window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/)?.[1] || '';
+      if (routerJson) break;
+    }
     if (!routerJson) throw new Error('抖音游客页面没有返回视频数据');
     let data;
     try { data = JSON.parse(routerJson); } catch { throw new Error('抖音游客页面数据解析失败'); }
@@ -374,7 +380,9 @@ function getDouyinAnonymousVideoInfo(id) {
     const timer = setTimeout(() => {
       cancelResolver(child);
       finish(new Error('匿名临时会话解析超时'));
-    }, 45000);
+      // 匿名会话要留出「起浏览器 → 抓数据 → 必要时换免沙箱模式重来一遍」的时间，
+      // 给得太紧会把本来能成的任务掐死在半路。
+    }, 120000);
     child.stdout.on('data', (data) => {
       stdout += data.toString('utf8');
       if (stdout.length > 1024 * 1024) {
@@ -695,7 +703,12 @@ async function runDouyinJob(job) {
         info = await getDouyinAnonymousVideoInfo(id);
         job.note = '游客页受限，已自动使用隔离匿名临时会话';
       } catch (anonymousError) {
-        throw new Error(`${visitorError.message}；${anonymousError.message}`);
+        // 游客页现在一概不吐作品数据（不是这条链接的问题），把它原样端出来只会让人
+        // 误以为是链接失效，压缩成一句说明，重点留给真正的失败原因。
+        const visitor = /抖音游客页面(没有返回视频数据|暂未提供这个作品的数据|数据解析失败)/.test(visitorError.message)
+          ? '抖音游客页不再提供作品数据'
+          : visitorError.message;
+        throw new Error(`${visitor}；${anonymousError.message}`);
       }
     }
     if (info.kind === 'images') {

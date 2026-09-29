@@ -158,10 +158,24 @@ class CdpClient {
   close() { try { this.socket.close(); } catch {} }
 }
 
+// 被宿主程序限制的进程里，Chrome 建不了自己的沙箱：网络进程反复崩溃、GPU 进程
+// FATAL 退出，最后连 DevTools 端口都答不上话。特征的报错文案都在这条正则里。
+const SANDBOX_BLOCKED_RE = /sandbox initialization failed|Failed to initialize sandbox/i;
+
+// Chrome 的 stderr 在正常启动时也会刷一堆 sandbox / GPU / allocator 警告，所以
+// 不能拿关键字去猜结论：先把最后一条真正致命的日志捞出来当证据。
+function chromeFatalLine(log) {
+  const lines = String(log || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/FATAL|:ERROR:|ERROR:/.test(lines[i])) return lines[i].slice(-240);
+  }
+  return lines.length ? lines[lines.length - 1].slice(-240) : '';
+}
+
 // 把 Chrome 起不来的常见原因翻译成用户能照着做的提示。
 function browserDiagnosis(log) {
-  if (/sandbox initialization failed|Failed to initialize sandbox/i.test(log)) {
-    return '当前运行环境不允许 Chrome 建立自身沙箱（常见于被宿主程序限制的进程），请在 Finder 里双击「启动视频下载器-macOS.command」重启工具后再试';
+  if (SANDBOX_BLOCKED_RE.test(log)) {
+    return '当前运行环境不允许 Chrome 建立自身沙箱（常见于被宿主程序限制的进程），可改用 --no-sandbox 的临时会话重试';
   }
   if (/GPU process isn't usable|GPU process exited unexpectedly/i.test(log)) {
     return 'Chrome 的 GPU 进程无法启动';
@@ -172,9 +186,30 @@ function browserDiagnosis(log) {
   return '';
 }
 
-async function waitForDevTools(profileDir, child) {
+// 启动失败时留一份现场：Chrome 的路径、参数、退出码、stderr 尾巴。下次再出问题
+// 不用猜。只保留最后一段，别把磁盘写满。
+function recordBrowserFailure(state, message) {
+  try {
+    const file = path.join(__dirname, '..', 'bin', 'browser.log');
+    const block = [
+      `===== ${new Date().toISOString()} ${message} =====`,
+      `browser=${state.browser || '(未找到)'} noSandbox=${!!state.noSandbox} exitCode=${state.child ? state.child.exitCode : '-'}`,
+      `args=${(state.args || []).join(' ')}`,
+      `spawnError=${state.spawnError ? state.spawnError.message : '-'}`,
+      state.log ? `stderr:\n${state.log.slice(-4000)}` : 'stderr: (空)',
+      '',
+    ].join('\n');
+    const previous = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    fs.writeFileSync(file, (previous + block).slice(-60000));
+  } catch {}
+}
+
+async function waitForDevTools(profileDir, child, state = {}) {
   const marker = path.join(profileDir, 'DevToolsActivePort');
-  for (let attempt = 0; attempt < 120; attempt++) {
+  // 全新配置目录的冷启动（杀毒扫描、Gatekeeper 校验、磁盘忙）偶尔会超过 12 秒，
+  // 给到 20 秒，别把能起得来的情况误判成起不来。
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (state.spawnError) throw new Error(`匿名浏览器启动失败：${state.spawnError.message}`);
     if (child && (child.killed || child.exitCode !== null)) throw new Error('临时浏览器已退出');
     if (fs.existsSync(marker)) {
       const port = fs.readFileSync(marker, 'utf8').split(/\r?\n/)[0];
@@ -216,33 +251,55 @@ function watchBrowserOwner(child, timeoutMs) {
   return () => { clearTimeout(timer); process.removeListener('disconnect', stop); process.removeListener('message', cancel); };
 }
 
-async function resolveAnonymous(videoId, proxy = '') {
-  if (!/^\d{15,25}$/.test(String(videoId || ''))) throw new Error('抖音视频编号无效');
+// 启动参数集中在这里，方便把 --no-sandbox 这条退路插进同一个地方。
+function chromeArgs(profileDir, proxy = '', noSandbox = false) {
+  const args = [
+    '--headless=new', '--incognito', '--mute-audio', '--disable-gpu', '--disable-extensions',
+    '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check',
+  ];
+  // 只在被宿主限制了沙箱时才退到 --no-sandbox：临时配置目录、不开扩展、只访问
+  // 公开页面、用完即删，换成能跑起来是划算的。
+  if (noSandbox) args.push('--no-sandbox');
+  if (proxy) args.push(`--proxy-server=${proxy}`);
+  args.push('--remote-debugging-port=0', `--user-data-dir=${profileDir}`, 'about:blank');
+  return args;
+}
+
+function startBrowser(browser, profileDir, proxy, noSandbox) {
+  const args = chromeArgs(profileDir, proxy, noSandbox);
+  const child = spawn(browser, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  const state = { browser, args, noSandbox, child, log: '', spawnError: null };
+  // spawn 失败（路径不可执行、被策略拦）只会走 error 事件；以前这里直接吞掉，
+  // 结果表现成"启动超时"，白白等十几秒还看不出原因。
+  child.on('error', (error) => { state.spawnError = error; });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (data) => { state.log = (state.log + data).slice(-8000); });
+  return state;
+}
+
+async function resolveOnce(videoId, proxy, noSandbox) {
   const browser = findBrowser();
   if (!browser) throw new Error('需要安装 Chrome 或 Edge 才能建立匿名临时会话');
 
   const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shinewood-douyin-'));
-  const args = [
-    '--headless=new', '--incognito', '--mute-audio', '--disable-gpu', '--disable-extensions',
-    '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check',
-    '--remote-debugging-port=0', `--user-data-dir=${profileDir}`, 'about:blank',
-  ];
-  if (proxy) args.splice(args.length - 1, 0, `--proxy-server=${proxy}`);
-  const child = spawn(browser, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-  child.on('error', () => {});
-  // Chrome 的 stderr 只用来在启动失败时给出可操作的诊断，不写入日志文件。
-  let browserLog = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (data) => { browserLog = (browserLog + data).slice(-4000); });
+  const state = startBrowser(browser, profileDir, proxy, noSandbox);
+  const { child } = state;
   const releaseOwnerWatch = watchBrowserOwner(child, 40000);
   let cdp;
   try {
     let port;
     try {
-      port = await waitForDevTools(profileDir, child);
+      port = await waitForDevTools(profileDir, child, state);
     } catch (error) {
-      const hint = browserDiagnosis(browserLog);
-      throw new Error(hint ? `${error.message}：${hint}` : error.message);
+      recordBrowserFailure(state, error.message);
+      const hint = browserDiagnosis(state.log);
+      const fatal = hint ? '' : chromeFatalLine(state.log);
+      const suffix = hint || fatal;
+      const failed = new Error(suffix ? `${error.message}：${suffix}` : error.message);
+      // 启动类失败都值得换一条参数再试一次，取数据阶段失败则不必。
+      failed.chromeStartupFailure = true;
+      failed.chromeSandboxBlocked = SANDBOX_BLOCKED_RE.test(state.log);
+      throw failed;
     }
     const target = await findPageTarget(port);
     cdp = new CdpClient(target.webSocketDebuggerUrl);
@@ -301,7 +358,8 @@ async function resolveAnonymous(videoId, proxy = '') {
       } catch {}
     });
 
-    // 图文作品在 /video/ 下常常取不到数据，退回 /note/ 再试一轮。
+    // 先访问 /video/ 再退回 /note/。实测图文作品走 /video/ 会自己跳到图文页并很快
+    // 吐出详情，反过来先开 /note/ 反而慢一倍，所以顺序不要调。
     const visit = async (pageUrl) => {
       await cdp.send('Page.navigate', { url: pageUrl });
       return Promise.race([found, sleep(18000).then(() => null)]);
@@ -311,9 +369,18 @@ async function resolveAnonymous(videoId, proxy = '') {
     if (!result) throw new Error('匿名临时会话没有取得播放地址（视频或图文）');
     return result;
   } catch (error) {
-    const hint = browserDiagnosis(browserLog);
-    if (!hint || String(error.message).includes(hint)) throw error;
-    throw new Error(`${error.message}：${hint}`);
+    // 已经带上启动失败标记的，原样往外抛，别被二次包装冲掉标记。
+    if (error.chromeStartupFailure) throw error;
+    // 浏览器起来了又掉线：同样是"起不来"，值得换参数再试一次。
+    const startup = /临时浏览器已关闭|浏览器连接失败|浏览器连接超时|浏览器页面未就绪/.test(String(error.message));
+    if (startup) {
+      recordBrowserFailure(state, error.message);
+      error.chromeStartupFailure = true;
+      error.chromeSandboxBlocked = SANDBOX_BLOCKED_RE.test(state.log);
+    }
+    const hint = browserDiagnosis(state.log);
+    if (hint && !String(error.message).includes(hint)) error.message = `${error.message}：${hint}`;
+    throw error;
   } finally {
     releaseOwnerWatch();
     cdp?.close();
@@ -321,6 +388,29 @@ async function resolveAnonymous(videoId, proxy = '') {
     await sleep(300);
     if (!path.resolve(profileDir).startsWith(path.resolve(os.tmpdir()) + path.sep) || !path.basename(profileDir).startsWith('shinewood-douyin-')) throw new Error('临时目录检查失败');
     try { fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 200 }); } catch {}
+  }
+}
+
+// 匿名临时会话：沙箱能建就用沙箱，建不了（被宿主程序限制的进程）就自动换
+// --no-sandbox 再跑一次，而不是直接放弃。调试时也可以用 SHINEWOOD_CHROME_NO_SANDBOX=1
+// 强制走免沙箱模式。
+function wantsNoSandbox(options) {
+  return options?.noSandbox === true || process.env.SHINEWOOD_CHROME_NO_SANDBOX === '1';
+}
+
+async function resolveAnonymous(videoId, proxy = '', options = {}) {
+  if (!/^\d{15,25}$/.test(String(videoId || ''))) throw new Error('抖音视频编号无效');
+  const noSandbox = wantsNoSandbox(options);
+  try {
+    return await resolveOnce(videoId, proxy, noSandbox);
+  } catch (error) {
+    if (noSandbox || !error.chromeStartupFailure) throw error;
+    try {
+      return await resolveOnce(videoId, proxy, true);
+    } catch (retryError) {
+      const first = String(error.message).split('：')[0];
+      throw new Error(`${first}（换用免沙箱模式后仍然失败：${retryError.message}）`);
+    }
   }
 }
 
@@ -337,4 +427,5 @@ if (require.main === module) {
 }
 
 module.exports = { chooseVideo, chooseImages, findItem, isAllowedMediaUrl, resolveAnonymous,
-  findBrowser, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner };
+  findBrowser, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner,
+  chromeArgs, browserDiagnosis, chromeFatalLine, SANDBOX_BLOCKED_RE };
