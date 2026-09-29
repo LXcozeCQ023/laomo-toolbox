@@ -39,6 +39,18 @@ assert.strictEqual(fallbackArgs[fallbackArgs.length - 1], 'about:blank');
 assert.strictEqual(douyinAnonymous.SANDBOX_BLOCKED_RE.test('Failed to initialize sandbox.'), true);
 assert.strictEqual(douyinAnonymous.SANDBOX_BLOCKED_RE.test('GPU process exited unexpectedly'), false);
 assert.match(douyinAnonymous.browserDiagnosis('Failed to initialize sandbox.'), /--no-sandbox/);
+// Chrome 必须从原生架构启动：从 Finder 双击的脚本 .app 会带下 Rosetta 架构偏好，
+// Chrome 一旦被拉成 x86 翻译模式，页面慢十倍、详情接口永远等不到。
+{
+  const launch = douyinAnonymous.browserCommand('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+  if (process.platform === 'darwin' && process.arch === 'arm64' && fs.existsSync('/usr/bin/arch')) {
+    assert.strictEqual(launch.command, '/usr/bin/arch');
+    assert.deepStrictEqual(launch.prefix, ['-arm64', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']);
+  } else {
+    assert.strictEqual(launch.command, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+    assert.deepStrictEqual(launch.prefix, []);
+  }
+}
 // Chrome 正常启动时 stderr 里也有 sandbox / GPU 噪声，所以诊断要以最后一条致命日志为准。
 assert.strictEqual(
   douyinAnonymous.chromeFatalLine('Failed to initialize sandbox.\n[1:FATAL:gpu.cc:417] GPU process isn\'t usable. Goodbye.'),

@@ -261,11 +261,28 @@ function watchBrowserOwner(child, timeoutMs) {
   return () => { clearTimeout(timer); process.removeListener('disconnect', stop); process.removeListener('message', cancel); };
 }
 
+// 排查现场用的轻量日志：匿名会话每一步记一行，文件自己截断，不会写满磁盘。
+// 只有这条链路异常时才需要看，正常时可以忽略。
+function diag(line) {
+  try {
+    const file = path.join(__dirname, '..', 'bin', 'browser.log');
+    const previous = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    fs.writeFileSync(file, (previous + `[${new Date().toISOString()}] ${line}\n`).slice(-60000));
+  } catch {}
+}
+
 // 启动参数集中在这里，方便把 --no-sandbox 这条退路插进同一个地方。
 function chromeArgs(profileDir, proxy = '', noSandbox = false) {
   const args = [
     '--headless=new', '--incognito', '--mute-audio', '--disable-gpu', '--disable-extensions',
     '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check',
+    // 从 launchd（双击启动的后台服务）拉起时，Chrome 会被系统当成后台程序：
+    // 隐藏页面的定时器被掐到一分钟一次，页面 JS 半死不活，渲染进程连
+    // Runtime.evaluate 都答不上话——表现就是"页面打开了但永远不来数据"。
+    // 这组参数是自动化场景的标准防抖配置，明确告诉 Chrome 别掐后台页面。
+    '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion',
   ];
   // 只在被宿主限制了沙箱时才退到 --no-sandbox：临时配置目录、不开扩展、只访问
   // 公开页面、用完即删，换成能跑起来是划算的。
@@ -275,9 +292,21 @@ function chromeArgs(profileDir, proxy = '', noSandbox = false) {
   return args;
 }
 
+// 从 Finder 双击的 .app 启动的脚本会被 LaunchServices 按 x86_64 拉起来（可执行文件
+// 是脚本，没有架构元数据），Rosetta 的架构偏好顺着 spawn 链一路传给 Chrome，
+// 渲染进程全在 x86 翻译模式下跑——页面慢十倍、详情接口永远等不到的根源。
+// 显式用 arch -arm64 起 Chrome，把它掰回原生；arch 会原地 exec，pid 就是 Chrome 自己。
+function browserCommand(browser) {
+  if (process.platform === 'darwin' && process.arch === 'arm64' && fs.existsSync('/usr/bin/arch')) {
+    return { command: '/usr/bin/arch', prefix: ['-arm64', browser] };
+  }
+  return { command: browser, prefix: [] };
+}
+
 function startBrowser(browser, profileDir, proxy, noSandbox) {
   const args = chromeArgs(profileDir, proxy, noSandbox);
-  const child = spawn(browser, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  const { command, prefix } = browserCommand(browser);
+  const child = spawn(command, [...prefix, ...args], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
   const state = { browser, args, noSandbox, child, log: '', spawnError: null };
   // spawn 失败（路径不可执行、被策略拦）只会走 error 事件；以前这里直接吞掉，
   // 结果表现成"启动超时"，白白等十几秒还看不出原因。
@@ -296,6 +325,7 @@ async function resolveOnce(videoId, proxy, noSandbox) {
   const { child } = state;
   const releaseOwnerWatch = watchBrowserOwner(child, 40000);
   let cdp;
+  diag(`开始 id=${videoId} proxy=${proxy || '(无)'} noSandbox=${!!noSandbox} pid=${child.pid}`);
   try {
     let port;
     try {
@@ -311,12 +341,18 @@ async function resolveOnce(videoId, proxy, noSandbox) {
       failed.chromeSandboxBlocked = SANDBOX_BLOCKED_RE.test(state.log);
       throw failed;
     }
+    diag(`DevTools 就绪 port=${port}`);
     const target = await findPageTarget(port);
+    diag(`页面 target=${target.url}`);
     cdp = new CdpClient(target.webSocketDebuggerUrl);
     await cdp.open();
+    diag('CDP 已连接');
     await cdp.send('Network.enable');
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
+    // 渲染进程一崩，页面 JS 就不再跑、详情接口永远不来，但浏览器本身还活着，
+    // 不监听这个事件就只能干等 18 秒然后报"没取到数据"。
+    await cdp.send('Inspector.enable').catch(() => {});
     await cdp.send('Network.setUserAgentOverride', {
       userAgent: DESKTOP_UA,
       acceptLanguage: 'zh-CN,zh;q=0.9',
@@ -325,6 +361,7 @@ async function resolveOnce(videoId, proxy, noSandbox) {
     await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
       source: "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})",
     });
+    diag('CDP 初始化完成');
 
     let finish;
     let settled = false;
@@ -332,6 +369,10 @@ async function resolveOnce(videoId, proxy, noSandbox) {
     const candidates = new Set();
     cdp.on(async (message) => {
       if (settled) return;
+      if (message.method === 'Inspector.targetCrashed') {
+        diag('页面渲染进程崩溃（页面 JS 不会再跑，这轮不会有数据）');
+        return;
+      }
       if (message.method === 'Network.responseReceived') {
         const { requestId, response, type } = message.params;
         const isJson = /(?:json|javascript)/i.test(response.mimeType || '');
@@ -345,6 +386,7 @@ async function resolveOnce(videoId, proxy, noSandbox) {
       try {
         const body = await cdp.send('Network.getResponseBody', { requestId: message.params.requestId });
         const text = body.base64Encoded ? Buffer.from(body.body, 'base64').toString('utf8') : body.body;
+        diag(`候选 JSON ${text.length}B 含编号=${text.includes(String(videoId))}`);
         if (text.length > 8 * 1024 * 1024 || !text.includes(String(videoId))) return;
         const item = findItem(JSON.parse(text), videoId);
         if (!item) return;
@@ -371,14 +413,33 @@ async function resolveOnce(videoId, proxy, noSandbox) {
     // 先访问 /video/ 再退回 /note/。实测图文作品走 /video/ 会自己跳到图文页并很快
     // 吐出详情，反过来先开 /note/ 反而慢一倍，所以顺序不要调。
     const visit = async (pageUrl) => {
-      await cdp.send('Page.navigate', { url: pageUrl });
-      return Promise.race([found, sleep(18000).then(() => null)]);
+      diag(`导航 ${pageUrl}`);
+      const nav = await cdp.send('Page.navigate', { url: pageUrl });
+      if (nav && nav.errorText) diag(`导航返回错误 ${pageUrl} -> ${nav.errorText}`);
+      diag(`导航已提交 ${pageUrl}`);
+      const outcome = await Promise.race([found, sleep(18000).then(() => null)]);
+      if (!outcome) {
+        diag(`18 秒没等到数据 ${pageUrl}`);
+        // 直接看看页面现在的样子：是验证页、空白页还是正常页面只是没吐数据。
+        try {
+          const snapshot = await cdp.send('Runtime.evaluate', {
+            expression: "[location.href, document.title, 'scripts='+document.scripts.length, 'imgs='+document.images.length, (document.body ? document.body.innerText.slice(0, 160).replace(/\\s+/g,' ') : '(body 为空)')].join(' | ')",
+            returnByValue: true,
+          });
+          diag(`页面状态：${snapshot?.result?.value ?? '(读不到)'}`);
+        } catch (snapError) {
+          diag(`读取页面状态失败：${snapError.message}`);
+        }
+      }
+      return outcome;
     };
     const result = await visit(`https://www.douyin.com/video/${videoId}`)
       || await visit(`https://www.douyin.com/note/${videoId}`);
     if (!result) throw new Error('匿名临时会话没有取得播放地址（视频或图文）');
+    diag(`取到数据 kind=${result.kind} count=${result.count || 1}`);
     return result;
   } catch (error) {
+    diag(`出错：${error.message}`);
     // 已经带上启动失败标记的，原样往外抛，别被二次包装冲掉标记。
     if (error.chromeStartupFailure) throw error;
     // 浏览器起来了又掉线：同样是"起不来"，值得换参数再试一次。
@@ -421,6 +482,7 @@ async function resolveAnonymous(videoId, proxy = '', options = {}) {
     return await resolveOnce(videoId, proxy, noSandbox);
   } catch (error) {
     if (noSandbox || !error.chromeStartupFailure) throw error;
+    diag(`首轮失败（${error.message}），换免沙箱模式重试`);
     try {
       return await resolveOnce(videoId, proxy, true);
     } catch (retryError) {
@@ -443,5 +505,5 @@ if (require.main === module) {
 }
 
 module.exports = { chooseVideo, chooseImages, findItem, isAllowedMediaUrl, resolveAnonymous,
-  findBrowser, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner,
+  findBrowser, browserCommand, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner,
   chromeArgs, browserDiagnosis, chromeFatalLine, SANDBOX_BLOCKED_RE };

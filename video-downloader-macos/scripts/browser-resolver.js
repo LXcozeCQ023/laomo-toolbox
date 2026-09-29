@@ -7,7 +7,7 @@ const path = require('path');
 const net = require('net');
 const dns = require('dns').promises;
 const { spawn } = require('child_process');
-const { findBrowser, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner } = require('./douyin-anonymous-resolver');
+const { findBrowser, browserCommand, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner } = require('./douyin-anonymous-resolver');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function publicAddress(value) {
@@ -100,7 +100,9 @@ async function resolvePage(pageUrl, proxy = '', { timeoutMs = 22000, allowTestOr
     '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--disable-sync',
     '--autoplay-policy=no-user-gesture-required', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'];
   if (proxy) args.splice(args.length - 1, 0, `--proxy-server=${proxy}`);
-  const child = spawn(browser, args, { windowsHide: true, stdio: 'ignore' });
+  // 双击启动的脚本链会把 Rosetta 架构偏好传给 Chrome，必须用 arch -arm64 掰回原生。
+  const { command, prefix } = browserCommand(browser);
+  const child = spawn(command, [...prefix, ...args], { windowsHide: true, stdio: 'ignore' });
   child.on('error', () => {});
   let cdp, closed = false;
   const releaseOwnerWatch = watchBrowserOwner(child, timeoutMs + 18000);
