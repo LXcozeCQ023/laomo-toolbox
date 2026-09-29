@@ -502,8 +502,29 @@ function convertToJpeg(src, dest) {
   });
 }
 
+// 单张原图的尝试次数：首轮 5 次，跑完一轮再回头补漏 3 次，都配指数退避。
+// 原来只试 3 次、间隔固定几百毫秒，一旦撞上连接成片断开的窗口就整单报废。
+const IMAGE_ATTEMPTS = 5;
+const IMAGE_RETRY_ATTEMPTS = 3;
+
+// 图集文件名形如 01.jpg / 07.webp，用它反推哪几张原图已经在本地。
+const IMAGE_FILE_RE = /^(\d{2})\.(jpe?g|png|webp|gif|heic|heif|avif)$/i;
+
+function existingImages(dir) {
+  const found = new Map();
+  let entries;
+  try { entries = fs.readdirSync(dir); } catch { return found; }
+  for (const name of entries) {
+    const m = IMAGE_FILE_RE.exec(name);
+    if (m) found.set(Number(m[1]), name);
+  }
+  return found;
+}
+
 async function saveDouyinImage(job, imageUrl, dir, index, info) {
   if (!isDouyinMediaUrl(imageUrl)) throw new Error('抖音图片地址未通过安全检查');
+  let host = '';
+  try { host = new URL(imageUrl).hostname; } catch {}
   const controller = new AbortController();
   let idleTimer;
   const resetIdleTimer = () => {
@@ -523,11 +544,12 @@ async function saveDouyinImage(job, imageUrl, dir, index, info) {
         },
       });
     } catch (error) {
-      // Node 只给一句 fetch failed，把底层原因（ECONNRESET 等）带出来，否则没法定位。
+      // Node 只给一句 fetch failed，把底层原因（ECONNRESET 等）和 CDN 主机带出来，否则没法定位。
       const cause = error.cause && (error.cause.message || error.cause.code);
-      throw new Error(cause ? `图片连接失败：${cause}` : error.message);
+      const detail = cause || error.message;
+      throw new Error(`图片连接失败：${detail}${host ? `（${host}）` : ''}`);
     }
-    if (!response.ok) throw new Error(`图片请求失败（HTTP ${response.status}）`);
+    if (!response.ok) throw new Error(`图片请求失败（HTTP ${response.status}${host ? `，${host}` : ''}）`);
     const contentType = response.headers.get('content-type') || '';
     if (!/^image\//i.test(contentType)) throw new Error('抖音返回的内容不是图片');
     const bytes = Buffer.from(await response.arrayBuffer());
@@ -556,9 +578,10 @@ async function downloadDouyinImages(job, info) {
   const baseName = douyinFolderName(info.title);
   const total = info.images.length;
   let target = path.join(job.dir, baseName);
+  let already = new Map();
   if (fs.existsSync(target)) {
-    const existing = fs.readdirSync(target).filter((name) => !name.startsWith('.')).length;
-    if (existing >= total) {
+    already = existingImages(target);
+    if (already.size >= total) {
       job.file = target;
       job.isDirectory = true;
       job.name = baseName;
@@ -566,36 +589,75 @@ async function downloadDouyinImages(job, info) {
       job.status = 'done'; job.phase = '完成'; job.pct = 100; job.speed = ''; job.eta = '';
       return;
     }
-    target = path.join(job.dir, `${baseName}-${job.id.slice(0, 4)}`);
+    // 同名目录里没有本工具下载的图片，说明是别的文件，另开一个目录避免互相覆盖；
+    // 有部分图片则是上一轮中断留下的，接着往同一个目录里补，不重复下载。
+    if (already.size === 0) target = path.join(job.dir, `${baseName}-${job.id.slice(0, 4)}`);
   }
   fs.mkdirSync(target, { recursive: true });
   job.file = target;
   job.isDirectory = true;
   job.name = path.basename(target);
-  job.note = `图文 · ${total} 张`;
-  const written = [];
-  try {
-    for (let i = 0; i < total; i++) {
+  job.note = already.size
+    ? `图文 · ${total} 张 · 续传（已有 ${already.size} 张）`
+    : `图文 · ${total} 张`;
+  // 到抖音图片 CDN 的连接会成片地断——同一小段时间里换新连接也照样在 TLS
+  // 握手阶段被掐，过一会儿又自己好了。所以失败的那几张不当场判死：先跳过接着下
+  // 后面的，一轮跑完再回头集中补。一张图卡住不该拖垮整个作品。
+  const queue = [];
+  for (let i = 0; i < total; i++) if (!already.has(i + 1)) queue.push(i);
+  let succeeded = already.size;
+  let failed = [];
+  let failedReason = '';
+
+  for (let round = 1; round <= 2 && queue.length; round++) {
+    failed = [];
+    const attempts = round === 1 ? IMAGE_ATTEMPTS : IMAGE_RETRY_ATTEMPTS;
+    for (const i of queue) {
       job.phase = `下载图文 ${i + 1}/${total}`;
-      let file = '';
-      for (let attempt = 1; ; attempt++) {
+      let ok = false;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
-          file = await saveDouyinImage(job, info.images[i], target, i + 1, info);
+          await saveDouyinImage(job, info.images[i], target, i + 1, info);
+          ok = true;
           break;
         } catch (error) {
-          // CDN 偶发连接重置很常见，单张图重试 3 次再判失败。
-          if (attempt >= 3) throw new Error(`${error.message}（第 ${i + 1} 张，已重试 3 次）`);
-          job.phase = `下载图文 ${i + 1}/${total} · 第 ${attempt + 1} 次尝试`;
-          await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+          failedReason = error.message;
+          // 内容本身不对（服务端直接回了个 HTML 页面之类）再试也是同样的结果，
+          // 只多给一次机会，不陪着耗完整个退避序列。
+          const limit = /不是图片|内容为空|不完整|无法识别/.test(error.message) ? 2 : attempts;
+          if (attempt >= limit) break;
+          // 固定几千毫秒的间隔救不回来，用指数退避（1/2/4/8 秒）加随机抖动，
+          // 把重试推出故障窗口，而不是在里面空转。
+          const wait = 1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 600);
+          job.phase = `下载图文 ${i + 1}/${total} · 第 ${attempt + 1} 次尝试（${Math.round(wait / 1000)} 秒后）`;
+          await new Promise((resolve) => setTimeout(resolve, wait));
         }
       }
-      written.push(file);
-      job.pct = Math.min(100, Math.round((i + 1) * 100 / total));
+      if (ok) {
+        succeeded++;
+        job.pct = Math.min(100, Math.round(succeeded * 100 / total));
+      } else {
+        failed.push(i);
+      }
+      // 逐张之间稍作停顿，别把一串新连接挤在同一瞬间。
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
-  } catch (error) {
-    written.forEach((file) => { try { fs.unlinkSync(file); } catch {} });
-    try { if (fs.readdirSync(target).length === 0) fs.rmdirSync(target); } catch {}
-    throw error;
+    if (failed.length) {
+      // 一轮下来还缺几张：让网络安静几秒再补，此时大部分图已经下完，
+      // 新的连接不会再和它们抢。
+      job.phase = `等待网络恢复，准备补下第 ${failed.map((i) => i + 1).join('、')} 张`;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+    queue.length = 0;
+    queue.push(...failed);
+  }
+
+  if (failed.length) {
+    // 已经下好的图片留在原地：点「再试一次」会接着补缺的那几张，
+    // 而不是把前面几十张全部作废重来。
+    const kept = existingImages(target).size;
+    job.note = `图文 · ${total} 张 · 已保留 ${kept} 张`;
+    throw new Error(`${failedReason}（第 ${failed.map((i) => i + 1).join('、')} 张失败）`);
   }
   job.speed = ''; job.eta = ''; job.pct = 100; job.phase = '完成'; job.status = 'done';
 }

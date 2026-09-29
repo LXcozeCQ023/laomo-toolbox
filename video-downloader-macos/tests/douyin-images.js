@@ -56,7 +56,8 @@ const server = http.createServer((req, res) => {
       flakyHits[index] = (flakyHits[index] || 0) + 1;
       if (index === 1 && flakyHits[index] === 1) { res.writeHead(503); return res.end('busy'); }
     }
-    if (mode === 'truncated' && index === 0) { res.writeHead(200, { 'Content-Type': 'image/jpeg' }); return res.end(truncated); }
+    // 让第 2 张坏掉：第 1 张会成功落地，用来验证失败时已下载的图片会被保留。
+    if (mode === 'truncated' && index === 1) { res.writeHead(200, { 'Content-Type': 'image/jpeg' }); return res.end(truncated); }
     res.writeHead(200, { 'Content-Type': 'image/jpeg' });
     return res.end(bytes[index]);
   }
@@ -80,7 +81,8 @@ globalThis.fetch = async (url, options) => {
 const app = require('../server');
 
 async function settled(job) {
-  for (let i = 0; i < 400 && job.status === 'running'; i++) await delay(50);
+  // 单张图最坏要跑满 5 次尝试和 1/2/4/8 秒的指数退避，等待上限必须够宽。
+  for (let i = 0; i < 2400 && job.status === 'running'; i++) await delay(50);
   assert.notStrictEqual(job.status, 'running', '图文任务超时');
   return job;
 }
@@ -108,21 +110,37 @@ async function settled(job) {
   assert.strictEqual(again.status, 'done');
   assert.match(again.note, /此前已下载过/, '已存在的图集不应重复下载');
 
-  // 同名目录里图片不全：另开一个带后缀的目录，既不覆盖也不混在一起。
+  // 同名目录里图片不全：那是上一轮中断留下的，应当就地续传补缺，
+  // 而不是把同一个作品反复下成 测试图文作品-xxxx 这种新目录。
   const partial = path.join(temp, 'partial');
   fs.mkdirSync(path.join(partial, '测试图文作品'), { recursive: true });
   fs.writeFileSync(path.join(partial, '测试图文作品', '01.jpg'), bytes[0]);
-  const conflict = await settled(app.newJob(link, partial));
+  const resume = await settled(app.newJob(link, partial));
+  assert.strictEqual(resume.status, 'done', resume.err);
+  assert.strictEqual(path.basename(resume.file), '测试图文作品', '图片不全的同名目录应就地续传');
+  assert.match(resume.note, /续传/, '续传任务应说明本地已有几张');
+  assert.deepStrictEqual(fs.readdirSync(resume.file).sort(), ['01.jpg', '02.jpg', '03.jpg'], '缺失的图片应补齐');
+  assert.deepStrictEqual(fs.readFileSync(path.join(resume.file, '01.jpg')), bytes[0], '已有图片不能被重新下载覆盖');
+
+  // 同名目录里放的不是本工具下载的图片：另开一个带后缀的目录，既不覆盖也不混在一起。
+  const occupied = path.join(temp, 'occupied');
+  fs.mkdirSync(path.join(occupied, '测试图文作品'), { recursive: true });
+  fs.writeFileSync(path.join(occupied, '测试图文作品', '说明.txt'), '别人的文件');
+  const conflict = await settled(app.newJob(link, occupied));
   assert.strictEqual(conflict.status, 'done', conflict.err);
-  assert.match(path.basename(conflict.file), /^测试图文作品-/, '不完整同名目录应另建新目录');
-  assert.strictEqual(fs.readdirSync(path.join(partial, '测试图文作品')).length, 1, '原有目录不能被覆盖');
+  assert.match(path.basename(conflict.file), /^测试图文作品-/, '同名目录不是本工具的图集时应另建新目录');
+  assert.deepStrictEqual(fs.readdirSync(path.join(occupied, '测试图文作品')), ['说明.txt'], '原有目录不能被覆盖');
   assert.strictEqual(fs.readdirSync(conflict.file).length, 3, '新目录应完整下载 3 张');
 
   mode = 'truncated';
-  const broken = await settled(app.newJob(link, path.join(temp, 'truncated')));
+  const truncatedDir = path.join(temp, 'truncated');
+  const broken = await settled(app.newJob(link, truncatedDir));
   assert.strictEqual(broken.status, 'error', '缺结尾标记的图必须判失败');
   assert.match(broken.err, /不完整|无法识别/);
-  assert.strictEqual(fs.readdirSync(path.join(temp, 'truncated')).filter(n => /\.jpg$/.test(n)).length, 0, '失败任务不应留下图片文件');
+  assert.match(broken.err, /第 2/, '失败信息应指明是第几张出的问题');
+  // 坏掉的那张不能拖垮整单：它前后已经下好的图都要留在原地，
+  // 点「再试一次」时只补第 2 张，而不是把整个作品重下。
+  assert.deepStrictEqual(fs.readdirSync(path.join(truncatedDir, '测试图文作品')).sort(), ['01.jpg', '03.jpg'], '失败任务应保留已下载的图片');
 
   mode = 'webp';
   const webpJob = await settled(app.newJob(link, path.join(temp, 'webpcase')));
@@ -142,7 +160,7 @@ async function settled(job) {
   assert.strictEqual(wrong.status, 'error', '非图片内容必须判失败');
   assert.match(wrong.err, /不是图片/);
 
-  console.log('抖音图文测试通过：标题第一句作子目录名、图集解析、逐张下载、序号命名、webp 转 jpg、偶发失败自动重试、文件头与结尾校验、重复识别、同名不覆盖、损坏与非图片内容拒绝。');
+  console.log('抖音图文测试通过：标题第一句作子目录名、图集解析、逐张下载、序号命名、webp 转 jpg、偶发失败自动重试、文件头与结尾校验、重复识别、同名目录续传补缺、非图集同名目录不覆盖、失败保留已下载图片、损坏与非图片内容拒绝。');
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; }).finally(() => {
   globalThis.fetch = realFetch;
   server.closeAllConnections();
