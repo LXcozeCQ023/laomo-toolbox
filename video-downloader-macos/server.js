@@ -667,6 +667,43 @@ function saveDouyinArticle(job, info) {
   job.speed = ''; job.eta = ''; job.pct = 100; job.phase = '完成'; job.status = 'done';
 }
 
+// mp4 只有画面和声音都在才算下完整（上次中断留下的半截文件不能算数）。
+function fileIsComplete(file) {
+  try {
+    if (!file || !fs.existsSync(file)) return false;
+    const streams = inspectMedia(file);
+    return !!(streams.video && streams.audio);
+  } catch { return false; }
+}
+
+// 抖音视频会配一份同名文案（.txt）。两样都摊在保存目录里，攒上几十个之后根本对不上
+// 号，所以按「标题 [编号]」建一个子文件夹，mp4 和文案一起放进去（图文、文章本来就是
+// 这个做法，这里补齐视频）。顺带把旧版本摊在外面的 mp4/文案收进文件夹 —— 已经下过的
+// 不该被重下一遍。fileIsComplete 会真的去跑 ffmpeg，所以每个文件只探一次。
+function planDouyinVideoTarget(jobDir, info, jobId) {
+  const stem = `${info.title} [${info.id}]`;
+  const folder = path.join(jobDir, stem);
+  const mainVideo = path.join(folder, `${stem}.mp4`);
+  const looseVideo = path.join(jobDir, `${stem}.mp4`);
+  let done = fileIsComplete(mainVideo);
+  let migrated = false;
+  if (!done && looseVideo !== mainVideo && fileIsComplete(looseVideo)) {
+    try {
+      fs.mkdirSync(folder, { recursive: true });
+      fs.renameSync(looseVideo, mainVideo);
+      const looseText = path.join(jobDir, `${stem}.txt`);
+      if (fs.existsSync(looseText)) fs.renameSync(looseText, path.join(folder, `${stem}.txt`));
+      done = true;
+      migrated = true;
+    } catch {}
+  }
+  // 文件夹里躺着一个不完整的同名文件（上次下到一半）：换个名字，既不覆盖也不硬用。
+  const videoFile = !done && fs.existsSync(mainVideo)
+    ? path.join(folder, `${stem}-${String(jobId).slice(0, 4)}.mp4`)
+    : mainVideo;
+  return { stem, folder, mainVideo, videoFile, done, migrated };
+}
+
 async function downloadDouyinImages(job, info) {
   // 图集单独建一个以作品标题命名的子文件夹，避免大量图片散落在保存目录里。
   const baseName = douyinFolderName(info.title);
@@ -791,19 +828,19 @@ async function runDouyinJob(job) {
       await downloadDouyinImages(job, info);
       return;
     }
-    job.name = `${info.title} [${info.id}].mp4`;
-    job.file = path.join(job.dir, job.name);
-    if (fs.existsSync(job.file)) {
-      const streams = inspectMedia(job.file);
-      if (streams.video && streams.audio) {
-        job.status = 'done'; job.phase = '完成'; job.pct = 100; job.note = '此前已下载过';
-        if (saveDouyinText(job.dir, `${path.basename(job.file, '.mp4')}.txt`, info)) job.note += ' · 含文案';
-        return;
-      }
-      job.file = path.join(job.dir, `${info.title} [${info.id}-${job.id.slice(0, 4)}].mp4`);
-      job.name = path.basename(job.file);
+    const plan = planDouyinVideoTarget(job.dir, info, job.id);
+    job.name = plan.stem;
+    job.file = plan.folder;
+    job.isDirectory = true;
+    if (plan.done) {
+      job.status = 'done'; job.phase = '完成'; job.pct = 100; job.speed = ''; job.eta = '';
+      job.note = plan.migrated ? '此前已下载过（已归入文件夹）' : '此前已下载过';
+      if (saveDouyinText(plan.folder, `${plan.stem}.txt`, info)) job.note += ' · 含文案';
+      return;
     }
 
+    const videoFile = plan.videoFile;
+    fs.mkdirSync(plan.folder, { recursive: true });
     fs.mkdirSync(tempDir, { recursive: true });
     partFile = path.join(tempDir, `${info.id}-${job.id}.mp4.part`);
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -819,13 +856,13 @@ async function runDouyinJob(job) {
         await new Promise(resolve => setTimeout(resolve, 800));
       }
     }
-    fs.renameSync(partFile, job.file);
+    fs.renameSync(partFile, videoFile);
     partFile = '';
     job.phase = '校验音视频';
-    const streams = inspectMedia(job.file);
+    const streams = inspectMedia(videoFile);
     if (!streams.video || !streams.audio) throw new Error('下载文件缺少画面或声音');
     job.status = 'done'; job.phase = '完成'; job.pct = 100; job.speed = ''; job.eta = '';
-    if (saveDouyinText(job.dir, `${path.basename(job.file, '.mp4')}.txt`, info)) job.note = (job.note ? `${job.note} · ` : '') + '含文案';
+    if (saveDouyinText(plan.folder, `${path.basename(videoFile, '.mp4')}.txt`, info)) job.note = (job.note ? `${job.note} · ` : '') + '含文案';
   } catch (error) {
     if (partFile) { try { fs.unlinkSync(partFile); } catch {} }
     job.status = 'error';
@@ -1438,7 +1475,7 @@ const server = http.createServer(async (req, res) => {
       const job = jobs.get(String(b.id || ''));
       if (!job || job.status !== 'done') return json(res, { err: '没有找到已完成的下载任务' }, 404);
       target = job.file || job.dir;
-      showDir = showDir || !!job.isDirectory;   // 图文任务存的是目录，直接打开而不是选中
+      showDir = showDir || !!job.isDirectory;   // 图文/文章/抖音视频存的都是目录，直接打开而不是选中文件
     }
     if (!target) return json(res, { err: '没有可打开的路径' }, 404);
     if (!fs.existsSync(target)) { target = conf.dir; showDir = true; }
@@ -1512,6 +1549,7 @@ module.exports = {
   inspectMedia, isXiaohongshuUrl, resolveXiaohongshuUrl,
   extractDouyinVideoId, getDouyinVideoInfo, isDouyinMediaUrl, isExpiredShareLink, newJob, isAllowedHost, isAllowedOrigin,
   extractUrl, recoverUrl, shareTextHint, saveDouyinText, saveDouyinArticle, douyinFolderName,
+  planDouyinVideoTarget, fileIsComplete,
   publicJob, MAX_JSON_BODY, BUILD_ID, INSTANCE_ID, finishVideoJob, canShutdown,
   proxyAlive, detectProxy, ensureProxy, getActiveProxy: () => ACTIVE_PROXY,
 };
