@@ -98,13 +98,19 @@ async function settled(job) {
   assert.match(job.note, /图文 · 3 张/);
   assert.strictEqual(path.basename(job.file), '测试图文作品', '子文件夹应直接用作品标题命名');
   assert.strictEqual(path.dirname(job.file), path.join(temp, 'downloads'), '子文件夹必须建在用户选定的保存目录内');
-  const files = fs.readdirSync(job.file).sort();
+  const raw = fs.readdirSync(job.file).sort();
+  const files = raw.filter(name => /^\d\d\./.test(name));
   assert.deepStrictEqual(files, ['01.jpg', '02.jpg', '03.jpg'], '图片应按序号命名');
   for (const name of files) {
     const buffer = fs.readFileSync(path.join(job.file, name));
     assert.strictEqual(buffer[0], 0xff, 'JPEG 文件头不对');
     assert.strictEqual(buffer[buffer.length - 1], 0xd9, 'JPEG 缺少结尾标记');
   }
+  // 作品文案（正文）要单独留一份文字稿，手机分享常常就是为了那一段字。
+  assert.ok(raw.includes('正文.txt'), '图集目录里应有正文.txt');
+  const article = fs.readFileSync(path.join(job.file, '正文.txt'), 'utf8');
+  assert.match(article, /^测试图文作品。/, '正文应从标题那句开始');
+  assert.match(article, /第二句不该出现在目录名里/, '正文要是完整的文案，不能只留第一句');
 
   const again = await settled(app.newJob(link, path.join(temp, 'downloads')));
   assert.strictEqual(again.status, 'done');
@@ -119,7 +125,7 @@ async function settled(job) {
   assert.strictEqual(resume.status, 'done', resume.err);
   assert.strictEqual(path.basename(resume.file), '测试图文作品', '图片不全的同名目录应就地续传');
   assert.match(resume.note, /续传/, '续传任务应说明本地已有几张');
-  assert.deepStrictEqual(fs.readdirSync(resume.file).sort(), ['01.jpg', '02.jpg', '03.jpg'], '缺失的图片应补齐');
+  assert.deepStrictEqual(fs.readdirSync(resume.file).sort().filter(n => /^\d\d\./.test(n)), ['01.jpg', '02.jpg', '03.jpg'], '缺失的图片应补齐');
   assert.deepStrictEqual(fs.readFileSync(path.join(resume.file, '01.jpg')), bytes[0], '已有图片不能被重新下载覆盖');
 
   // 同名目录里放的不是本工具下载的图片：另开一个带后缀的目录，既不覆盖也不混在一起。
@@ -130,7 +136,7 @@ async function settled(job) {
   assert.strictEqual(conflict.status, 'done', conflict.err);
   assert.match(path.basename(conflict.file), /^测试图文作品-/, '同名目录不是本工具的图集时应另建新目录');
   assert.deepStrictEqual(fs.readdirSync(path.join(occupied, '测试图文作品')), ['说明.txt'], '原有目录不能被覆盖');
-  assert.strictEqual(fs.readdirSync(conflict.file).length, 3, '新目录应完整下载 3 张');
+  assert.strictEqual(fs.readdirSync(conflict.file).filter(n => /^\d\d\./.test(n)).length, 3, '新目录应完整下载 3 张');
 
   mode = 'truncated';
   const truncatedDir = path.join(temp, 'truncated');
@@ -145,7 +151,7 @@ async function settled(job) {
   mode = 'webp';
   const webpJob = await settled(app.newJob(link, path.join(temp, 'webpcase')));
   assert.strictEqual(webpJob.status, 'done', webpJob.err);
-  assert.deepStrictEqual(fs.readdirSync(webpJob.file).sort(), ['01.jpg', '02.jpg', '03.jpg'], 'webp 图集应统一转成 jpg');
+  assert.deepStrictEqual(fs.readdirSync(webpJob.file).sort().filter(n => /^\d\d\./.test(n)), ['01.jpg', '02.jpg', '03.jpg'], 'webp 图集应统一转成 jpg');
   const jpeg = fs.readFileSync(path.join(webpJob.file, '01.jpg'));
   assert.strictEqual(jpeg[0], 0xff, '转码结果应为 JPEG');
   assert.strictEqual(jpeg[jpeg.length - 1], 0xd9, '转码结果应有 JPEG 结尾');
@@ -153,7 +159,7 @@ async function settled(job) {
   mode = 'flaky';
   const flakyJob = await settled(app.newJob(link, path.join(temp, 'flaky')));
   assert.strictEqual(flakyJob.status, 'done', flakyJob.err);
-  assert.strictEqual(fs.readdirSync(flakyJob.file).length, 3, '单张图偶发失败应自动重试成功');
+  assert.strictEqual(fs.readdirSync(flakyJob.file).filter(n => /^\d\d\./.test(n)).length, 3, '单张图偶发失败应自动重试成功');
 
   mode = 'notimage';
   const wrong = await settled(app.newJob(link, path.join(temp, 'notimage')));

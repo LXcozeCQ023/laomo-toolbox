@@ -43,6 +43,25 @@ function extractUrl(value) {
   return m ? m[0].replace(/[，。！？；、,)\]}>]+$/g, '') : '';
 }
 
+// 手机分享的文案里 http:// 这几个字符有时会被聊天软件吃掉，只剩 v.douyin.com/xxxx 这样的
+// 裸域名。补回去还能救回一部分，总比直接判失败强。
+function recoverUrl(value) {
+  const m = String(value || '').match(/(?:v\.douyin\.com|www\.douyin\.com|www\.iesdouyin\.com)\/[^\s，。！？；、"'）)\]}】]+/i);
+  if (!m) return '';
+  const tail = m[0].replace(/[，。！？；、,)\]}>]+$/g, '');
+  return `https://${tail}`;
+}
+
+// 手机分享出来的文案里，抖音会故意把链接打散（像「1.04 g@x.ca:/ 03/15」这种噪声），
+// 最后只剩一串 App 口令（※※…ˇˇ）。那串码只有抖音 App 内部能解开，服务端解析不了。
+// 与其让它一路走到「没有识别出视频编号」让人以为是工具坏了，不如当场说清楚怎么拿链接。
+function shareTextHint(value) {
+  const text = String(value || '');
+  if (!/抖音/.test(text)) return '';
+  if (!/(打开抖音|复制此链接|长按复制|复制打开|※※|ˇˇ)/.test(text)) return '';
+  return '这是抖音的口令文案，里面没有真正的链接（抖音把链接故意打散了，那串码只有 App 内部能解开）。请在抖音里打开这个作品 → 分享 → 复制链接，把 https://v.douyin.com/... 这样的链接发过来；电脑版抖音分享出来的链接也可以';
+}
+
 function inspectMedia(file) {
   if (!FFMPEG || !file || !fs.existsSync(file)) return { video: false, audio: false };
   const r = spawnSync(FFMPEG, ['-hide_banner', '-protocol_whitelist', 'file', '-format_whitelist', 'mov,matroska,webm,mpegts,avi,flv,ogg', '-i', file,
@@ -328,6 +347,7 @@ async function getDouyinVideoInfo(originalUrl) {
         kind: 'video',
         id,
         title: safeFileName(item.desc),
+        text: String(item.desc || ''),
         url: `https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(videoId)}&ratio=1080p&line=0`,
         userAgent: DOUYIN_MOBILE_UA,
         referer: 'https://www.iesdouyin.com/',
@@ -340,6 +360,7 @@ async function getDouyinVideoInfo(originalUrl) {
         kind: 'images',
         id,
         title: safeFileName(item.desc),
+        text: String(item.desc || ''),
         images,
         userAgent: DOUYIN_MOBILE_UA,
         referer: 'https://www.iesdouyin.com/',
@@ -412,6 +433,7 @@ function getDouyinAnonymousVideoInfo(id) {
           kind,
           id: String(id),
           title: safeFileName(data.title),
+          text: String(data.desc || data.title || ''),
           url,
           images,
           userAgent: String(data.userAgent || DOUYIN_MOBILE_UA),
@@ -597,6 +619,15 @@ async function saveDouyinImage(job, imageUrl, dir, index, info) {
   }
 }
 
+// 作品文案（正文）单独存一份文字稿：图文存进它自己的文件夹，视频放在 mp4 旁边。
+// 手机分享常常就是为了那一段文字，光有图片/视频不够看。
+function saveDouyinText(targetDir, fileName, info) {
+  const body = String(info?.text || '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (!body) return '';
+  const file = path.join(targetDir, fileName);
+  try { fs.writeFileSync(file, `${body}\n`); return file; } catch { return ''; }
+}
+
 async function downloadDouyinImages(job, info) {
   // 图集单独建一个以作品标题命名的子文件夹，避免大量图片散落在保存目录里。
   const baseName = douyinFolderName(info.title);
@@ -611,6 +642,7 @@ async function downloadDouyinImages(job, info) {
       job.name = baseName;
       job.note = `图文 · ${total} 张 · 此前已下载过`;
       job.status = 'done'; job.phase = '完成'; job.pct = 100; job.speed = ''; job.eta = '';
+      if (saveDouyinText(target, '正文.txt', info)) job.note += ' · 含正文';
       return;
     }
     // 同名目录里没有本工具下载的图片，说明是别的文件，另开一个目录避免互相覆盖；
@@ -684,6 +716,7 @@ async function downloadDouyinImages(job, info) {
     throw new Error(`${failedReason}（第 ${failed.map((i) => i + 1).join('、')} 张失败）`);
   }
   job.speed = ''; job.eta = ''; job.pct = 100; job.phase = '完成'; job.status = 'done';
+  if (saveDouyinText(target, '正文.txt', info)) job.note += ' · 含正文';
 }
 
 async function runDouyinJob(job) {
@@ -721,6 +754,7 @@ async function runDouyinJob(job) {
       const streams = inspectMedia(job.file);
       if (streams.video && streams.audio) {
         job.status = 'done'; job.phase = '完成'; job.pct = 100; job.note = '此前已下载过';
+        if (saveDouyinText(job.dir, `${path.basename(job.file, '.mp4')}.txt`, info)) job.note += ' · 含文案';
         return;
       }
       job.file = path.join(job.dir, `${info.title} [${info.id}-${job.id.slice(0, 4)}].mp4`);
@@ -748,6 +782,7 @@ async function runDouyinJob(job) {
     const streams = inspectMedia(job.file);
     if (!streams.video || !streams.audio) throw new Error('下载文件缺少画面或声音');
     job.status = 'done'; job.phase = '完成'; job.pct = 100; job.speed = ''; job.eta = '';
+    if (saveDouyinText(job.dir, `${path.basename(job.file, '.mp4')}.txt`, info)) job.note = (job.note ? `${job.note} · ` : '') + '含文案';
   } catch (error) {
     if (partFile) { try { fs.unlinkSync(partFile); } catch {} }
     job.status = 'error';
@@ -906,7 +941,8 @@ async function runYtdlpJob(job, options = {}) {
   else { args.push('-f', 'b'); }
   // B站补齐 Referer；Clash 开启时统一交给其规则选择直连或代理线路。
   if (/bilibili\.com|b23\.tv/.test(url)) args.push('--add-header', 'Referer:https://www.bilibili.com/');
-  if (ACTIVE_PROXY) args.push('--proxy', ACTIVE_PROXY);
+  const useProxy = !!ACTIVE_PROXY && !isPrivateHost(downloadUrl);
+  if (useProxy) args.push('--proxy', ACTIVE_PROXY);
   if (options.fromBrowser) {
     args.push('--referer', options.referer, '--user-agent', options.userAgent);
     const videoId = crypto.createHash('sha256').update(url).digest('hex').slice(0, 10);
@@ -928,6 +964,11 @@ async function runYtdlpJob(job, options = {}) {
       PYTHONIOENCODING: 'utf-8',
       PYTHONUNBUFFERED: '1',
     };
+    // yt-dlp 也会读环境变量里的代理。目标在本机/内网时必须把它们摘掉，
+    // 否则子进程照样把 127.0.0.1 的请求往代理上撞，直接连不上。
+    if (!useProxy) {
+      for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) delete childEnv[key];
+    }
     const runArgs = args.slice();
     runArgs.push('--', downloadUrl);   // 原链接和识别后的地址都通过独立参数传递。
     const child = spawn(YTDLP_CMD[0], YTDLP_CMD.slice(1).concat(runArgs), { env: childEnv, windowsHide: true });
@@ -1135,6 +1176,18 @@ function isAllowedHost(value) {
   }
 }
 
+// 本机、内网地址不该绕代理：一旦把 --proxy 交给 yt-dlp，它连 127.0.0.1 的本地服务
+// 也会往代理上撞，结果就是「连不上」。代理只留给出不去的外网站点。
+function isPrivateHost(value) {
+  let host = '';
+  try { host = new URL(String(value)).hostname.toLowerCase(); } catch { return false; }
+  if (host === 'localhost' || host === '::1' || host.endsWith('.local')) return true;
+  const ip = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!ip) return false;
+  const [a, b] = [Number(ip[1]), Number(ip[2])];
+  return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+}
+
 function isAllowedOrigin(value) {
   if (!value) return true;
   try {
@@ -1307,8 +1360,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.url === '/api/download') {
     if (typeof b.url !== 'string' || b.url.length > 16384) return json(res, { err: '请提供有效长度的视频链接文本' }, 400);
-    let url = extractUrl(b.url);
-    if (!url) return json(res, { err: '没有识别到 http/https 视频链接' }, 400);
+    let url = extractUrl(b.url) || recoverUrl(b.url);
+    if (!url) return json(res, { err: shareTextHint(b.url) || '没有识别到 http/https 视频链接' }, 400);
     try { const u = new URL(url); if (!/^https?:$/.test(u.protocol) || u.username || u.password) throw new Error(); }
     catch { return json(res, { err: '视频链接格式无效或包含账号密码' }, 400); }
     if (yangshipin.isYangshipinUrl(url)) {
@@ -1415,6 +1468,7 @@ if (require.main === module) {
 module.exports = {
   inspectMedia, isXiaohongshuUrl, resolveXiaohongshuUrl,
   extractDouyinVideoId, getDouyinVideoInfo, isDouyinMediaUrl, isExpiredShareLink, newJob, isAllowedHost, isAllowedOrigin,
+  extractUrl, recoverUrl, shareTextHint, saveDouyinText,
   publicJob, MAX_JSON_BODY, BUILD_ID, INSTANCE_ID, finishVideoJob, canShutdown,
   proxyAlive, detectProxy, ensureProxy, getActiveProxy: () => ACTIVE_PROXY,
 };

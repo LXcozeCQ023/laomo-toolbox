@@ -401,6 +401,8 @@ async function resolveOnce(videoId, proxy, noSandbox) {
         const base = {
           id: String(videoId),
           title: String(item.desc || '抖音作品').slice(0, 200),
+          // 正文原样带出来（文件名用上面那份截断过的，这里要完整的文案）
+          desc: String(item.desc || ''),
           userAgent: DESKTOP_UA,
           referer: 'https://www.douyin.com/',
         };
