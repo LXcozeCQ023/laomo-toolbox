@@ -241,12 +241,12 @@ function safeFileName(value, fallback = '抖音视频') {
   return (cleaned || fallback).slice(0, 80);
 }
 
-// 图文文件夹名取作品标题的第一句（标题常是多句长文案），再压到 40 字符。
-function douyinFolderName(title) {
-  const flat = safeFileName(title, '抖音图文');
+// 图集/文章文件夹名取作品标题的第一句（标题常是多句长文案），再压到 40 字符。
+function douyinFolderName(title, fallback = '抖音图文') {
+  const flat = safeFileName(title, fallback);
   const sentence = flat.match(/^[^。！？!?]*[。！？!?]/)?.[0] || '';
   const name = (sentence || flat).slice(0, 40).replace(/[。！？!?. ]+$/, '').trim();
-  return name || '抖音图文';
+  return name || fallback;
 }
 
 function findDouyinItem(value, id) {
@@ -290,7 +290,9 @@ async function resolveXiaohongshuUrl(value) {
 
 function extractDouyinVideoId(value) {
   const text = String(value || '');
-  const pathId = text.match(/\/(?:video|note)\/(\d{15,25})(?:[/?#]|$)/i)?.[1];
+  // article 是抖音的长文路由：分享出来的短链会 302 到 /article/<id>，和视频/图文一样
+  // 用同一个作品编号，正文得靠页面渲染，所以这里必须认它，否则连解析都进不去。
+  const pathId = text.match(/\/(?:video|note|article)\/(\d{15,25})(?:[/?#]|$)/i)?.[1];
   if (pathId) return pathId;
   try {
     const parsed = new URL(text);
@@ -386,8 +388,12 @@ function getDouyinAnonymousVideoInfo(id) {
       return reject(new Error('匿名临时会话组件不可用'));
     }
     const args = [DOUYIN_ANONYMOUS_RESOLVER, String(id)];
-    if (ACTIVE_PROXY) args.push(ACTIVE_PROXY);
-    const child = spawn(JS_NODE, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...process.env, NO_COLOR: '1' } });
+    // 刻意不给临时浏览器传代理：抖音在国内直连就能访问，而本机代理端口会漂移，
+    // 一旦把失效或不匹配的代理（例如 http 端口当成 socks5 用）交给 Chrome，导航
+    // 就会卡死，表现成「浏览器操作超时」。代理只留给真正需要出网的站点。
+    const childEnv = { ...process.env, NO_COLOR: '1' };
+    for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) delete childEnv[key];
+    const child = spawn(JS_NODE, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: childEnv });
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     let stdout = '';
     let stderr = '';
@@ -419,7 +425,25 @@ function getDouyinAnonymousVideoInfo(id) {
       try {
         const data = JSON.parse(stdout);
         if (String(data.id) !== String(id)) throw new Error('返回的作品信息不匹配');
-        const kind = data.kind === 'images' ? 'images' : 'video';
+        const kind = data.kind === 'images' || data.kind === 'article' ? data.kind : 'video';
+        // 文章（长文）：没有播放地址也没有图片清单，交出来的就是正文本身。
+        if (kind === 'article') {
+          const text = String(data.text || '');
+          // 正文没抓全宁可判失败让用户重试，也别落一份半截的文字稿。
+          if (text.length < 80) throw new Error('返回的文章正文不完整');
+          return finish(null, {
+            kind,
+            id: String(id),
+            title: safeFileName(data.title, '抖音文章'),
+            text,
+            date: String(data.date || ''),
+            sourceUrl: String(data.sourceUrl || `https://www.douyin.com/article/${id}`),
+            url: '',
+            images: [],
+            userAgent: String(data.userAgent || DOUYIN_MOBILE_UA),
+            referer: 'https://www.douyin.com/',
+          });
+        }
         let url = '';
         let images = [];
         if (kind === 'images') {
@@ -628,6 +652,21 @@ function saveDouyinText(targetDir, fileName, info) {
   try { fs.writeFileSync(file, `${body}\n`); return file; } catch { return ''; }
 }
 
+// 抖音「文章」（长文）是独立的一类：没有播放地址、也没有图片清单，正文只在页面里。
+// 落盘方式跟图集保持一致：按标题建子文件夹，文字稿叫 正文.txt，末尾留一行来源。
+function saveDouyinArticle(job, info) {
+  const target = path.join(job.dir, douyinFolderName(info.title, '抖音文章'));
+  fs.mkdirSync(target, { recursive: true });
+  const head = [info.title, info.date].filter(Boolean).join('\n');
+  const tail = info.sourceUrl ? `\n\n————————————\n来源：${info.sourceUrl}\n` : '\n';
+  fs.writeFileSync(path.join(target, '正文.txt'), `${head}\n\n${info.text}${tail}`);
+  job.file = target;
+  job.isDirectory = true;
+  job.name = path.basename(target);
+  job.note = `文章 · ${info.text.length} 字`;
+  job.speed = ''; job.eta = ''; job.pct = 100; job.phase = '完成'; job.status = 'done';
+}
+
 async function downloadDouyinImages(job, info) {
   // 图集单独建一个以作品标题命名的子文件夹，避免大量图片散落在保存目录里。
   const baseName = douyinFolderName(info.title);
@@ -743,6 +782,10 @@ async function runDouyinJob(job) {
           : visitorError.message;
         throw new Error(`${visitor}；${anonymousError.message}`);
       }
+    }
+    if (info.kind === 'article') {
+      saveDouyinArticle(job, info);
+      return;
     }
     if (info.kind === 'images') {
       await downloadDouyinImages(job, info);
@@ -1116,9 +1159,9 @@ html[data-theme="dark"] .platforms span,html[data-theme="dark"] .badge,html[data
   <div class="themerow"><button id="themeToggle" type="button">切换为暗色</button></div>
 </header>
 <main class="card">
-  <label class="label" for="url">把视频链接贴在这里</label>
+  <label class="label" for="url">把链接贴在这里</label>
   <div class="row">
-    <input id="url" type="text" placeholder="粘贴抖音、小红书、B站、YouTube 等视频链接" autocomplete="off" autofocus>
+    <input id="url" type="text" placeholder="粘贴抖音（视频 / 图文 / 文章）、小红书、B站、YouTube 等链接" autocomplete="off" autofocus>
     <button id="go" class="primary">开始下载</button>
   </div>
   <div class="formerr" id="formErr"></div>
@@ -1468,7 +1511,7 @@ if (require.main === module) {
 module.exports = {
   inspectMedia, isXiaohongshuUrl, resolveXiaohongshuUrl,
   extractDouyinVideoId, getDouyinVideoInfo, isDouyinMediaUrl, isExpiredShareLink, newJob, isAllowedHost, isAllowedOrigin,
-  extractUrl, recoverUrl, shareTextHint, saveDouyinText,
+  extractUrl, recoverUrl, shareTextHint, saveDouyinText, saveDouyinArticle, douyinFolderName,
   publicJob, MAX_JSON_BODY, BUILD_ID, INSTANCE_ID, finishVideoJob, canShutdown,
   proxyAlive, detectProxy, ensureProxy, getActiveProxy: () => ACTIVE_PROXY,
 };

@@ -184,10 +184,64 @@ function browserDiagnosis(log) {
   if (/GPU process isn't usable|GPU process exited unexpectedly/i.test(log)) {
     return 'Chrome 的 GPU 进程无法启动';
   }
-  if (/allocator multiple times/i.test(log)) {
-    return 'Chrome 启动参数被外部环境干扰';
-  }
+  // 以前这里还有一条 allocator 分支，会给出「启动参数被外部环境干扰」。实测是误伤：
+  // Chrome 正常启动也常打印这类分配器警告，而真正的原因是导航阶段卡住（多半是
+  // 代理不通），拿启动噪声去归因只会把排查方向带偏，所以删掉。
   return '';
+}
+
+// 抖音文章的正文只存在于页面 DOM 里（作品数据接口查不到），而且 class 名是混淆的，
+// 认结构比认名字稳：正文容器的特征就是「子元素几乎全是段落」。光看这一点还不够——
+// 导航栏和页脚同样是一堆 <p>，而且行数可能更多，所以再加两条判据：段落得是成句的
+// （平均长度够），并且不能行行都是链接。
+const ARTICLE_PATH_RE = /^\/article\//;
+const ARTICLE_EXTRACT = `(() => {
+  const BLOCK = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'BLOCKQUOTE', 'FIGCAPTION']);
+  const text = (el) => (el && el.innerText ? el.innerText : '').trim();
+  let best = null;
+  for (const el of document.querySelectorAll('div,section,article,main')) {
+    const kids = [...el.children];
+    const blocks = kids.filter((node) => BLOCK.has(node.tagName));
+    if (blocks.length < 3) continue;
+    const values = blocks.map(text).filter(Boolean);
+    if (values.length < 3) continue;
+    const avg = values.reduce((sum, value) => sum + value.length, 0) / values.length;
+    if (avg < 20) continue;
+    if (el.querySelectorAll('a').length >= values.length) continue;
+    const score = values.length * (blocks.length / kids.length);
+    if (!best || score > best.score) best = { values, score };
+  }
+  const body = String(document.body ? document.body.innerText : '');
+  return JSON.stringify({
+    ok: !!best,
+    title: document.title || '',
+    text: best ? best.values.join('\\n\\n') : '',
+    date: (body.match(/\\d{4}-\\d{2}-\\d{2}/) || [''])[0],
+  });
+})()`;
+
+// <title> 形如「标题 #话题1 #话题2 - 抖音」，正文稿只要标题本身。
+function articleTitle(raw) {
+  return String(raw || '')
+    .replace(/\s*[-–—|]\s*抖音\s*$/, '')
+    .replace(/(?:\s*#[^\s#]+)+\s*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 页面 innerText 里夹着零宽字符和段落间的多余空行，落盘前统一压成「段落之间一个空行」。
+function normalizeArticleText(value) {
+  const lines = String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim());
+  const out = [];
+  for (const line of lines) {
+    if (!line && (!out.length || !out[out.length - 1])) continue;
+    out.push(line);
+  }
+  return out.join('\n').trim();
 }
 
 // 启动失败时留一份现场：Chrome 的路径、参数、退出码、stderr 尾巴。下次再出问题
@@ -422,12 +476,54 @@ async function resolveOnce(videoId, proxy, noSandbox) {
 
     // 先访问 /video/ 再退回 /note/。实测图文作品走 /video/ 会自己跳到图文页并很快
     // 吐出详情，反过来先开 /note/ 反而慢一倍，所以顺序不要调。
+    //
+    // 抖音的「文章」（长文）是另一条路由：/video/<id> 会自己跳到 /article/<id>，
+    // 作品数据里既没有 video 也没有 images，正文只在 DOM 里。所以在等作品数据的
+    // 同时顺便盯一眼地址栏，只要落到文章页就地把标题和正文抠出来，不用白等 18 秒。
+    const readArticle = async () => {
+      const page = await cdp.send('Runtime.evaluate', { expression: ARTICLE_EXTRACT, returnByValue: true });
+      const parsed = JSON.parse(String(page?.result?.value || '{}'));
+      // 正文还在渲染时页面上只有导航和页脚，此时 ok 是 false，宁可下一轮再看，
+      // 也别把页脚当成正文交出去。
+      if (!parsed.ok) return null;
+      const text = normalizeArticleText(parsed.text);
+      if (text.length < 80) return null;
+      return {
+        id: String(videoId),
+        kind: 'article',
+        title: articleTitle(parsed.title) || '抖音文章',
+        text,
+        date: String(parsed.date || ''),
+        sourceUrl: `https://www.douyin.com/article/${videoId}`,
+        userAgent: DESKTOP_UA,
+      };
+    };
+    const watchArticle = async () => {
+      for (let round = 0; round < 13; round++) {
+        await sleep(1200);
+        if (settled) return null;
+        let pathname = '';
+        try {
+          const probe = await cdp.send('Runtime.evaluate', { expression: 'location.pathname', returnByValue: true });
+          pathname = String(probe?.result?.value || '');
+        } catch { continue; }
+        if (!ARTICLE_PATH_RE.test(pathname)) continue;
+        try {
+          const article = await readArticle();
+          if (!article) continue;
+          settled = true;
+          diag(`取到文章正文 ${article.text.length} 字符 ${article.title}`);
+          return article;
+        } catch { continue; }
+      }
+      return null;
+    };
     const visit = async (pageUrl) => {
       diag(`导航 ${pageUrl}`);
       const nav = await cdp.send('Page.navigate', { url: pageUrl });
       if (nav && nav.errorText) diag(`导航返回错误 ${pageUrl} -> ${nav.errorText}`);
       diag(`导航已提交 ${pageUrl}`);
-      const outcome = await Promise.race([found, sleep(18000).then(() => null)]);
+      const outcome = await Promise.race([found, watchArticle(), sleep(18000).then(() => null)]);
       if (!outcome) {
         diag(`18 秒没等到数据 ${pageUrl}`);
         // 直接看看页面现在的样子：是验证页、空白页还是正常页面只是没吐数据。
@@ -445,8 +541,8 @@ async function resolveOnce(videoId, proxy, noSandbox) {
     };
     const result = await visit(`https://www.douyin.com/video/${videoId}`)
       || await visit(`https://www.douyin.com/note/${videoId}`);
-    if (!result) throw new Error('匿名临时会话没有取得播放地址（视频或图文）');
-    diag(`取到数据 kind=${result.kind} count=${result.count || 1}`);
+    if (!result) throw new Error('匿名临时会话没有取得播放地址（视频、图文或文章）');
+    diag(`取到数据 kind=${result.kind} ${result.kind === 'article' ? `字数=${result.text.length}` : `count=${result.count || 1}`}`);
     return result;
   } catch (error) {
     diag(`出错：${error.message}`);
@@ -459,8 +555,16 @@ async function resolveOnce(videoId, proxy, noSandbox) {
       error.chromeStartupFailure = true;
       error.chromeSandboxBlocked = SANDBOX_BLOCKED_RE.test(state.log);
     }
-    const hint = browserDiagnosis(state.log);
-    if (hint && !String(error.message).includes(hint)) error.message = `${error.message}：${hint}`;
+    // 只有「浏览器根本没起来」才适合拿启动日志归因：Chrome 正常启动也会刷一堆
+    // sandbox / GPU 警告，用它去解释「页面打开之后卡住」会把排查带偏。
+    if (error.chromeStartupFailure) {
+      const hint = browserDiagnosis(state.log);
+      if (hint && !String(error.message).includes(hint)) error.message = `${error.message}：${hint}`;
+    } else if (/浏览器操作超时/.test(String(error.message))) {
+      // CDP 命令 5 秒没有回应，说明导航请求被卡住了。临时浏览器最多是被本机代理
+      // 拦在门外，跟 Chrome 的启动参数无关，直接说清楚省得又去猜。
+      error.message = `${error.message}（临时浏览器没能完成导航，通常是本机代理不可达）`;
+    }
     throw error;
   } finally {
     releaseOwnerWatch();
@@ -516,4 +620,5 @@ if (require.main === module) {
 
 module.exports = { chooseVideo, chooseImages, findItem, isAllowedMediaUrl, resolveAnonymous,
   findBrowser, browserCommand, CdpClient, waitForDevTools, findPageTarget, stopBrowser, watchBrowserOwner,
-  chromeArgs, browserDiagnosis, chromeFatalLine, SANDBOX_BLOCKED_RE };
+  chromeArgs, browserDiagnosis, chromeFatalLine, SANDBOX_BLOCKED_RE,
+  ARTICLE_PATH_RE, ARTICLE_EXTRACT, articleTitle, normalizeArticleText };
